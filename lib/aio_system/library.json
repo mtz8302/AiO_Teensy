@@ -1,0 +1,17 @@
+{
+  "name": "aio_system",
+  "version": "1.0.0",
+  "description": "AiO v26 System Components",
+  "keywords": ["system", "logging", "network"],
+  "authors": {
+    "name": "AiO v26 Team"
+  },
+  "dependencies": [
+    {"name": "QNEthernet"},
+    {"name": "ArduinoJson"},
+    {"name": "FlasherX"},
+    {"name": "Adafruit_PWM-Servo-Driver"}
+  ],
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

@@ -1,0 +1,1833 @@
+// Firmware_Teensy_AiO-New-Dawn is copyright 2025 by the AOG Group
+// Firmware_Teensy_AiO-New-Dawn is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+// Firmware_Teensy_AiO-New-Dawn is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License along with Firmware_Teensy_AiO-New-Dawn. If not, see <https://www.gnu.org/licenses/>.
+// Like most Arduino code, portions of this are based on other open source Arduino code with a compatiable license.
+
+#include "AutosteerProcessor.h"
+#include "PGNProcessor.h"
+#include "ADProcessor.h"
+#include "EncoderProcessor.h"
+#include "MotorDriverInterface.h"
+#include "TractorCANDriver.h"
+#include "ConfigManager.h"
+#include "LEDManagerFSM.h"
+#include "EventLogger.h"
+#include "QNetworkBase.h"
+#include "HardwareManager.h"
+#include "WheelAngleFusion.h"
+#include "MotorDriverManager.h"
+#include "KickoutMonitor.h"
+#include "MessageBuilder.h"
+#include <cmath>  // For sin() function
+
+// External network function
+extern void sendUDPbytes(uint8_t* data, int len);
+
+// External objects and pointers
+extern ConfigManager configManager;
+// extern LEDManager ledManager; // Using FSM version now
+extern ADProcessor adProcessor;
+extern MotorDriverInterface* motorPTR;
+extern WheelAngleFusion* wheelAngleFusionPtr;
+
+// No longer need external network config - using ConfigManager
+// extern struct NetworkConfig netConfig;
+
+// Global pointer definition
+AutosteerProcessor* autosteerPTR = nullptr;
+
+// Singleton instance
+AutosteerProcessor* AutosteerProcessor::instance = nullptr;
+
+// Helper function: Get brand-specific valve/motor not ready message
+static const char* getTractorValveMessage(TractorBrand brand) {
+    switch (brand) {
+        case TractorBrand::VALTRA_MASSEY:
+            return "Valtra/MF steering valve not ready! Check CAN connection.";
+        case TractorBrand::FENDT:
+        case TractorBrand::FENDT_ONE:
+            return "Fendt steering valve not ready! Check CAN connection.";
+        case TractorBrand::CASEIH_NH:
+            return "Case IH/NH steering valve not ready! Check CAN connection.";
+        case TractorBrand::CLAAS:
+            return "CLAAS steering valve not ready! Check CAN connection.";
+        case TractorBrand::JCB:
+            return "JCB steering valve not ready! Check CAN connection.";
+        case TractorBrand::CAT_MT:
+            return "CAT MT steering valve not ready! Check CAN connection.";
+        case TractorBrand::LINDNER:
+            return "Lindner steering valve not ready! Check CAN connection.";
+        case TractorBrand::GENERIC:
+            return "Keya motor not responding! Check CAN connection.";
+        default:
+            return "Tractor steering not ready! Check CAN connection.";
+    }
+}
+
+AutosteerProcessor::AutosteerProcessor() {
+}
+
+AutosteerProcessor* AutosteerProcessor::getInstance() {
+    if (instance == nullptr) {
+        instance = new AutosteerProcessor();
+    }
+    return instance;
+}
+
+bool AutosteerProcessor::init() {
+    // Check if already initialized to prevent duplicate PGN registrations
+    static bool initialized = false;
+    if (initialized) {
+        LOG_DEBUG(EventSource::AUTOSTEER, "AutosteerProcessor already initialized, updating VWAS only");
+        
+        // Just update VWAS if needed
+        if (configManager.getINSUseFusion() && !wheelAngleFusionPtr) {
+            initializeFusion();
+        }
+        return true;
+    }
+    
+    LOG_INFO(EventSource::AUTOSTEER, "Initializing AutosteerProcessor");
+    
+    // Make sure instance is set
+    instance = this;
+    autosteerPTR = this;  // Also set global pointer
+    
+    // Initialize motor config tracking from EEPROM values
+    previousMotorConfig = configManager.getMotorDriverConfig();
+    previousCytronDriver = configManager.getCytronDriver() ? 1 : 0;
+    motorConfigInitialized = true;
+    LOG_INFO(EventSource::AUTOSTEER, "Motor config tracking initialized: Config=0x%02X, Cytron=%d", 
+             previousMotorConfig, previousCytronDriver);
+    
+    // Initialize Virtual WAS if enabled
+    if (configManager.getINSUseFusion()) {
+        initializeFusion();
+    }
+    
+    // Initialize button pin
+    pinMode(2, INPUT_PULLUP);
+    LOG_DEBUG(EventSource::AUTOSTEER, "Button pin 2 configured as INPUT_PULLUP");
+    
+    // Initialize LOCK output pin (SLEEP_PIN = 4)
+    pinMode(4, OUTPUT);
+    digitalWrite(4, LOW);  // Start with LOCK OFF (like NG-V6)
+    LOG_DEBUG(EventSource::AUTOSTEER, "LOCK output pin 4 configured as OUTPUT, initially LOW");
+    
+    // Load steer settings from EEPROM
+    configManager.loadSteerSettings();
+
+    // Update ADProcessor with loaded values
+    adProcessor.setWASOffset(configManager.getWasOffset());
+    adProcessor.setWASCountsPerDegree(configManager.getSteerSensorCounts());
+
+    // Load and apply soft start settings
+    softStartDurationMs = configManager.getSoftStartDurationMs();
+    softAccelDurationMs = softStartDurationMs / 2;  // Direction changes use half duration
+
+    LOG_INFO(EventSource::AUTOSTEER, "Loaded steer settings from EEPROM: offset=%d, CPD=%d, highPWM=%d",
+             configManager.getWasOffset(), configManager.getSteerSensorCounts(), configManager.getHighPWM());
+    LOG_INFO(EventSource::AUTOSTEER, "Soft start: duration=%dms (accel=%dms)",
+             softStartDurationMs, softAccelDurationMs);
+    
+    // PID functionality is now integrated directly in updateMotorControl()
+    
+    // Register PGN handlers with PGNProcessor
+    if (PGNProcessor::instance) {
+        LOG_DEBUG(EventSource::AUTOSTEER, "Registering PGN callbacks...");
+        
+        // Register for broadcast messages (PGN 200, 202)
+        bool regBroadcast = PGNProcessor::instance->registerBroadcastCallback(handlePGNStatic, "AutosteerHandler");
+        
+        // Register for PGN 251 (Steer Config)
+        bool reg251 = PGNProcessor::instance->registerCallback(251, handlePGNStatic, "AutosteerHandler");
+        
+        // Register for PGN 252 (Steer Settings)
+        bool reg252 = PGNProcessor::instance->registerCallback(252, handlePGNStatic, "AutosteerHandler");
+        
+        // Register for PGN 254 (Steer Data with button)
+        bool reg254 = PGNProcessor::instance->registerCallback(254, handlePGNStatic, "AutosteerHandler");
+            
+        LOG_DEBUG(EventSource::AUTOSTEER, "PGN registrations: Broadcast=%d, 251=%d, 252=%d, 254=%d", regBroadcast, reg251, reg252, reg254);
+    } else {
+        LOG_ERROR(EventSource::AUTOSTEER, "PGNProcessor not initialized!");
+        return false;
+    }
+    
+    // Initialize KickoutMonitor
+    kickoutMonitor = KickoutMonitor::getInstance();
+    if (kickoutMonitor) {
+        kickoutMonitor->init(motorPTR);
+        LOG_INFO(EventSource::AUTOSTEER, "KickoutMonitor initialized");
+    } else {
+        LOG_ERROR(EventSource::AUTOSTEER, "Failed to initialize KickoutMonitor");
+    }
+    
+    LOG_INFO(EventSource::AUTOSTEER, "AutosteerProcessor initialized successfully");
+    initialized = true;  // Mark as initialized to prevent duplicate PGN registrations
+    return true;
+}
+
+void AutosteerProcessor::initializeFusion() {
+    LOG_INFO(EventSource::AUTOSTEER, "Virtual WAS enabled - initializing VWAS system");
+    
+    // Create fusion instance if not already created
+    if (!wheelAngleFusionPtr) {
+        wheelAngleFusionPtr = new WheelAngleFusion();
+    }
+    
+    // Initialize with sensor interfaces
+    // Any motor driver that reports position feedback can feed VWAS -
+    // this covers TractorCANDriver-with-Keya as well as KeyaSerialDriver
+    // (RS232 Keya). hasPositionFeedback() already encodes the correct
+    // per-driver logic (e.g. TractorCANDriver only returns true if the
+    // configured tractor type is actually a Keya-based one).
+    MotorDriverInterface* encoderDriver = nullptr;
+    if (motorPTR && motorPTR->hasPositionFeedback()) {
+        encoderDriver = motorPTR;
+    }
+    
+    extern GNSSProcessor* gnssProcessorPtr;
+    extern IMUProcessor imuProcessor;  // Global instance, not pointer
+    
+    if (wheelAngleFusionPtr->init(encoderDriver, gnssProcessorPtr, &imuProcessor)) {
+        LOG_INFO(EventSource::AUTOSTEER, "Virtual WAS (VWAS) initialized successfully");
+        
+        // Load fusion config from saved values
+        WheelAngleFusion::Config fusionConfig = wheelAngleFusionPtr->getConfig();
+        fusionConfig.wheelbase = 2.14f;  // Corrected from wrong hardcoded 2.5f -
+                                          // confirmed from real vehicle.xml export.
+                                          // TODO(Phase 3): import from AgOpenGPS
+                                          // vehicle.xml via web UI instead of hardcoding.
+        fusionConfig.vehicleType = 0;    // TODO(Phase 3): import setVehicle_vehicleType
+                                          // (0=Standard, 2=Articulated/Knicklenker)
+        fusionConfig.countsPerDegree = 100.0f;  // Default counts - not yet configurable
+        wheelAngleFusionPtr->setConfig(fusionConfig);
+
+        // Override defaults with anything saved previously via the web UI
+        // (manual entry or vehicle.xml import) - see saveVWASConfig().
+        loadVWASConfig();
+    } else {
+        LOG_ERROR(EventSource::AUTOSTEER, "Failed to initialize Virtual WAS");
+        configManager.setINSUseFusion(false);  // Disable VWAS
+        delete wheelAngleFusionPtr;
+        wheelAngleFusionPtr = nullptr;
+    }
+}
+
+void AutosteerProcessor::process() {
+    // === 100Hz AUTOSTEER LOOP (called by SimpleScheduler) ===
+    
+    // Track link state for down detection
+    static bool previousLinkState = true;
+    bool currentLinkState = QNetworkBase::isConnected();
+    
+    if (previousLinkState && !currentLinkState) {
+        // Link just went DOWN
+        LOG_WARNING(EventSource::AUTOSTEER, "Motor disabled - ethernet link down");
+        linkWasDown = true;  // Set flag for handleSteerData
+    }
+    previousLinkState = currentLinkState;
+
+    // Update Virtual WAS if enabled (must keep running during calibration
+    // too - the sweep reads encoderAngle at each mechanical stop)
+    if (wheelAngleFusionPtr && configManager.getINSUseFusion()) {
+        float dt = 10.0f / 1000.0f;  // 10ms = 0.01 seconds (100Hz from SimpleScheduler)
+        wheelAngleFusionPtr->update(dt);
+    }
+
+    // --- VWAS endstop calibration sweep takes exclusive motor control ---
+    // Runs instead of (not alongside) the normal button/PID/motor logic
+    // below, to avoid any interaction with the normal steering path while
+    // deliberately driving the motor to its mechanical stops.
+    if (vwasCalibrationInProgress()) {
+        processVWASCalibration();
+        return;
+    }
+
+    // === BUTTON/SWITCH LOGIC ===
+    // Static variable for Massey/Fendt/CaseIH button state tracking (needs to persist across cycles)
+    static bool lastMasseyEngageState = false;
+    static bool lastFendtButtonState = false;
+    static bool lastCaseIHEngageState = false;
+    static bool lastCATMTEngageState = false;
+    static bool lastClaasEngageState = false;
+    static bool lastJcbEngageState = false;
+    static bool lastLindnerEngageState = false;
+
+    // Debug: log button/switch config periodically
+    static uint32_t lastConfigLog = 0;
+    if (millis() - lastConfigLog > 5000) {
+        lastConfigLog = millis();
+        LOG_DEBUG(EventSource::AUTOSTEER, "Button config: button=%d, switch=%d",
+                  configManager.getSteerButton(), configManager.getSteerSwitch());
+    }
+
+    if (configManager.getSteerButton() || configManager.getSteerSwitch()) {
+        if (configManager.getSteerButton()) {
+            // BUTTON MODE - Toggle on press
+            static bool lastButtonReading = HIGH;
+            bool buttonReading = adProcessor.isSteerSwitchOn() ? LOW : HIGH;  // Convert to active low
+
+            // Check CAN engage buttons via unified API or legacy per-brand flags
+            bool canEngagePressed = false;
+            const char* canEngageLabel = "button";
+
+            if (motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+                TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+
+                // Unified path: protocol engine handles edge detection internally
+                if (tractorCAN->checkEngageEvent()) {
+                    canEngagePressed = true;
+                    canEngageLabel = tractorCAN->getEngageLabel();
+                }
+
+                // Legacy fallback: check brand-specific flags when protocol engine not active
+                if (!canEngagePressed) {
+                    // Check Massey button (falling edge)
+                    bool currentMasseyEngage = tractorCAN->isEngageButtonPressed();
+                    if (!currentMasseyEngage && lastMasseyEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "Massey K_Bus button";
+                    }
+                    lastMasseyEngageState = currentMasseyEngage;
+
+                    // Check Fendt button (falling edge)
+                    bool currentFendtButton = tractorCAN->isFendtButtonPressed();
+                    if (!currentFendtButton && lastFendtButtonState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "Fendt armrest button";
+                    }
+                    lastFendtButtonState = currentFendtButton;
+
+                    // Check Case IH (rising edge)
+                    bool currentCaseIHEngage = tractorCAN->isCaseIHEngaged();
+                    if (currentCaseIHEngage && !lastCaseIHEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "Case IH engage";
+                    }
+                    lastCaseIHEngageState = currentCaseIHEngage;
+
+                    // Check CAT MT (rising edge)
+                    bool currentCATMTEngage = tractorCAN->isCATMTEngaged();
+                    if (currentCATMTEngage && !lastCATMTEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "CAT MT engage";
+                    }
+                    lastCATMTEngageState = currentCATMTEngage;
+
+                    // Check CLAAS (rising edge)
+                    bool currentClaasEngage = tractorCAN->isClaasEngaged();
+                    if (currentClaasEngage && !lastClaasEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "CLAAS engage";
+                    }
+                    lastClaasEngageState = currentClaasEngage;
+
+                    // Check JCB (rising edge)
+                    bool currentJcbEngage = tractorCAN->isJcbEngaged();
+                    if (currentJcbEngage && !lastJcbEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "JCB engage";
+                    }
+                    lastJcbEngageState = currentJcbEngage;
+
+                    // Check Lindner (rising edge)
+                    bool currentLindnerEngage = tractorCAN->isLindnerEngaged();
+                    if (currentLindnerEngage && !lastLindnerEngageState) {
+                        canEngagePressed = true;
+                        canEngageLabel = "Lindner engage";
+                    }
+                    lastLindnerEngageState = currentLindnerEngage;
+                }
+            }
+
+            // Check if any button was pressed (physical or CAN)
+            if ((buttonReading == LOW && lastButtonReading == HIGH) || canEngagePressed) {
+
+                // SAFETY CHECK: Verify motor/valve ready before engagement
+                // Only check for TractorCAN drivers (not PWM or Keya Serial)
+                if (motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+                    TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+
+                    if (tractorCAN) {
+                        TractorBrand brand = tractorCAN->getCurrentBrand();
+                        bool motorReady = false;
+
+                        // Check readiness based on brand
+                        if (brand == TractorBrand::GENERIC) {
+                            // Keya CAN - check heartbeat
+                            motorReady = tractorCAN->isHeartbeatValid();
+                        } else {
+                            // Tractor brands - check valve ready
+                            motorReady = tractorCAN->isValveReady();
+                        }
+
+                        // Block engagement if not ready
+                        if (!motorReady) {
+                            const char* message = getTractorValveMessage(brand);
+                            MessageBuilder::sendHardwarePopup(message, 5, 1);  // 5 sec, warning color
+
+                            LOG_WARNING(EventSource::AUTOSTEER,
+                                "Autosteer engagement blocked - motor/valve not ready (brand: %d)",
+                                static_cast<int>(brand));
+
+                            // Don't toggle state - exit early
+                            lastButtonReading = buttonReading;
+                            return;
+                        }
+                    }
+                }
+                // else: PWM_MOTOR or KEYA_SERIAL - no check needed, proceed normally
+
+                // Button was just pressed - toggle state
+                steerState = !steerState;
+                LOG_INFO(EventSource::AUTOSTEER, "Autosteer %s via %s press",
+                         steerState == 0 ? "ARMED" : "DISARMED",
+                         canEngagePressed ? canEngageLabel : "button");
+
+                // Reset encoder count when autosteer is armed
+                if (steerState == 0 && EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+                    EncoderProcessor::getInstance()->resetPulseCount();
+                    LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset for new engagement");
+                }
+
+                // Pulse blue LED for button press
+                ledManagerFSM.pulseButton();
+            }
+            lastButtonReading = buttonReading;
+        } else {
+            // SWITCH MODE - Follow switch position
+            bool switchOn = adProcessor.isSteerSwitchOn();
+            static bool lastSwitchState = false;
+
+            if (switchOn != lastSwitchState) {
+                // SAFETY CHECK: Verify motor/valve ready before engagement (only when arming)
+                if (switchOn) {  // Only check when switching ON (arming)
+                    if (motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+                        TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+
+                        if (tractorCAN) {
+                            TractorBrand brand = tractorCAN->getCurrentBrand();
+                            bool motorReady = false;
+
+                            // Check readiness based on brand
+                            if (brand == TractorBrand::GENERIC) {
+                                motorReady = tractorCAN->isHeartbeatValid();
+                            } else {
+                                motorReady = tractorCAN->isValveReady();
+                            }
+
+                            // Block engagement if not ready
+                            if (!motorReady) {
+                                const char* message = getTractorValveMessage(brand);
+                                MessageBuilder::sendHardwarePopup(message, 5, 1);
+
+                                LOG_WARNING(EventSource::AUTOSTEER,
+                                    "Autosteer engagement blocked via switch - motor/valve not ready (brand: %d)",
+                                    static_cast<int>(brand));
+
+                                // Don't update switch state - keep it disarmed
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // Switch state changed
+                steerState = switchOn ? 0 : 1;  // 0 = armed, 1 = disarmed
+                LOG_INFO(EventSource::AUTOSTEER, "Autosteer %s via switch", 
+                         steerState == 0 ? "ARMED" : "DISARMED");
+                
+                // Reset encoder count when autosteer is armed
+                if (steerState == 0 && EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+                    EncoderProcessor::getInstance()->resetPulseCount();
+                    LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset for new engagement");
+                }
+                
+                lastSwitchState = switchOn;
+            }
+        }
+    }
+    
+    // Handle deferred disarm (AOG OSB handshake)
+    // After briefly arming for a valve-not-ready rejection, disarm once AOG has had
+    // time to see the armed status and toggle the OSB off.
+    if (pendingDisarm && (millis() - pendingDisarmTime >= DISARM_HANDSHAKE_MS)) {
+        pendingDisarm = false;
+        steerState = 1;
+        sendPGN253();
+        LOG_INFO(EventSource::AUTOSTEER, "Deferred disarm complete - motor/valve was not ready");
+    }
+
+    // Check if guidance status changed from AgOpenGPS
+    if (guidanceStatusChanged) {
+        LOG_INFO(EventSource::AUTOSTEER, "Guidance status changed: %s (steerState=%d, hasKickout=%d)",
+                 guidanceActive ? "ACTIVE" : "INACTIVE", steerState,
+                 kickoutMonitor ? kickoutMonitor->hasKickout() : 0);
+
+        if (guidanceActive) {
+            // SAFETY CHECK: Verify motor/valve ready before engagement
+            if (motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+                TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+                if (tractorCAN) {
+                    TractorBrand brand = tractorCAN->getCurrentBrand();
+                    bool motorReady = false;
+
+                    if (brand == TractorBrand::GENERIC) {
+                        // Keya motor - check heartbeat validity
+                        motorReady = tractorCAN->isHeartbeatValid();
+                    } else {
+                        // Tractor CAN valve - check valve ready status
+                        motorReady = tractorCAN->isValveReady();
+                    }
+
+                    // If not ready, briefly arm so AOG sees the state change
+                    // (needed for OSB handshake), then schedule a deferred disarm
+                    if (!motorReady) {
+                        const char* message = getTractorValveMessage(brand);
+                        MessageBuilder::sendHardwarePopup(message, 5, 1);
+
+                        LOG_WARNING(EventSource::AUTOSTEER,
+                            "Motor/valve not ready (brand: %d) - arming briefly for AOG handshake",
+                            static_cast<int>(brand));
+
+                        steerState = 0;  // Arm temporarily
+                        sendPGN253();    // AOG sees armed status immediately
+                        pendingDisarm = true;
+                        pendingDisarmTime = millis();
+                        guidanceStatusChanged = false;
+                        return;
+                    }
+                }
+            }
+
+            // Guidance turned ON in AgOpenGPS
+            steerState = 0;  // Activate steering
+            LOG_INFO(EventSource::AUTOSTEER, "Autosteer ARMED via AgOpenGPS (Guidance ON)");
+
+            // If there's a kickout active, clear it
+            if (kickoutMonitor && kickoutMonitor->hasKickout()) {
+                kickoutMonitor->clearKickout();
+                LOG_INFO(EventSource::AUTOSTEER, "KICKOUT: Cleared via AgOpenGPS (Guidance ON)");
+            }
+            
+            // Reset encoder count when autosteer engages
+            if (EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+                EncoderProcessor::getInstance()->resetPulseCount();
+                LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset for new engagement");
+            }
+        }
+        guidanceStatusChanged = false;  // Clear flag
+    }
+    
+    // If AgOpenGPS has stopped steering, turn off after delay
+    // BUT only if not using a physical switch in switch mode OR button mode
+    static int switchCounter = 0;
+    bool physicalSwitchActive = configManager.getSteerSwitch() && adProcessor.isSteerSwitchOn();
+    bool buttonModeActive = configManager.getSteerButton();
+
+    if (steerState == 0 && !guidanceActive && !physicalSwitchActive && !buttonModeActive) {
+        if (switchCounter++ > 30) {  // 30 * 10ms = 300ms delay
+            steerState = 1;
+            switchCounter = 0;
+            LOG_INFO(EventSource::AUTOSTEER, "Autosteer DISARMED - guidance inactive");
+            sendPGN253();  // Immediate feedback to AgOpenGPS
+        }
+    } else {
+        switchCounter = 0;
+    }
+
+    // Check for valve/motor lost during active steering
+    // If steering is armed and the tractor CAN valve goes not-ready, disarm immediately
+    if (steerState == 0 && motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+        TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+        if (tractorCAN) {
+            TractorBrand brand = tractorCAN->getCurrentBrand();
+            bool motorReady = (brand == TractorBrand::GENERIC)
+                ? tractorCAN->isHeartbeatValid()
+                : tractorCAN->isValveReady();
+
+            if (!motorReady) {
+                steerState = 1;  // Disarm
+                emergencyStop();
+                const char* message = getTractorValveMessage(brand);
+                MessageBuilder::sendHardwarePopup(message, 5, 1);
+                LOG_WARNING(EventSource::AUTOSTEER, "Autosteer DISARMED - valve/motor not ready during steering");
+            }
+        }
+    }
+
+    // Check for work switch changes and log them
+    static bool lastWorkState = false;
+    bool currentWorkState = adProcessor.isWorkSwitchOn();
+    if (currentWorkState != lastWorkState) {
+        LOG_INFO(EventSource::AUTOSTEER, "Work switch %s", 
+                 currentWorkState ? "ON (sections active)" : "OFF (sections inactive)");
+        lastWorkState = currentWorkState;
+    }
+    
+    // Pressure sensor kickout is now handled by KickoutMonitor
+    static bool lastPressureSensorState = false;
+    bool currentPressureSensorState = configManager.getPressureSensor();
+    if (currentPressureSensorState != lastPressureSensorState) {
+        LOG_INFO(EventSource::AUTOSTEER, "Pressure sensor kickout %s", 
+                 currentPressureSensorState ? "ENABLED" : "DISABLED");
+        lastPressureSensorState = currentPressureSensorState;
+    }
+    
+    // Check motor status for errors (including CAN connection loss)
+    if (motorPTR) {
+        MotorStatus motorStatus = motorPTR->getStatus();
+        if (motorStatus.hasError && steerState == 0 && guidanceActive) {
+            LOG_WARNING(EventSource::AUTOSTEER, "KICKOUT: Motor error detected");
+            emergencyStop();
+            return;  // Skip the rest of this cycle
+        }
+        
+        // Keya motor slip (TractorCAN+Keya) is detected via KickoutMonitor below.
+    }
+    
+    // Track when button/switch is pressed while in kickout
+    static uint32_t kickoutButtonPressTime = 0;
+    static bool kickoutButtonPressed = false;
+    
+    // Process motor driver (for serial communication)
+    if (motorPTR) motorPTR->process();
+    
+    // Process kickout monitoring
+    if (kickoutMonitor) {
+        kickoutMonitor->process();
+
+        // Check if kickout is active while steering is armed
+        if (kickoutMonitor->hasKickout() && steerState == 0) {
+            // Disarm steering - this will stop the motor
+            steerState = 1;  // Disarmed
+            emergencyStop();
+            LOG_WARNING(EventSource::AUTOSTEER, "KICKOUT: %s - steering disarmed", kickoutMonitor->getReasonString());
+            kickoutButtonPressTime = millis();  // Start grace period for button clear
+            kickoutButtonPressed = false;
+            // Don't clear kickout here - let KickoutMonitor auto-clear when conditions return to normal
+        }
+
+        // Grace period after kickout - allow button/switch to clear it
+        if (kickoutMonitor->hasKickout() && steerState == 0 && !kickoutButtonPressed &&
+            millis() - kickoutButtonPressTime < 5000) {  // 5 second grace period
+            // User pressed button/switch to re-arm during grace period - clear kickout
+            kickoutMonitor->clearKickout();
+            kickoutButtonPressed = true;
+            LOG_INFO(EventSource::AUTOSTEER, "KICKOUT: Cleared via button/switch during grace period");
+
+            // Reset encoder count
+            if (EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+                EncoderProcessor::getInstance()->resetPulseCount();
+                LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset for new engagement");
+            }
+        }
+
+        // Check for OSB re-engagement during kickout
+        // When in kickout (steerState=1) and guidance is active, check if user is trying to re-engage
+        // The OSB doesn't change any bits, but we can detect repeated clicks by watching for
+        // guidance going off then on again quickly
+        static uint32_t lastGuidanceOffTime = 0;
+        static bool waitingForGuidanceOn = false;
+
+        if (kickoutMonitor->hasKickout() && steerState == 1) {
+            if (!guidanceActive && prevGuidanceStatus) {
+                // Guidance just went OFF - user might have clicked OSB
+                lastGuidanceOffTime = millis();
+                waitingForGuidanceOn = true;
+            }
+            else if (guidanceActive && !prevGuidanceStatus && waitingForGuidanceOn &&
+                     (millis() - lastGuidanceOffTime < 1000)) {
+                // Guidance went back ON within 1 second - this is an OSB toggle
+                waitingForGuidanceOn = false;
+
+                LOG_INFO(EventSource::AUTOSTEER, "Guidance toggle detected during kickout - clearing kickout");
+
+                // Clear kickout and re-arm
+                kickoutMonitor->clearKickout();
+                steerState = 0;  // Re-arm
+                LOG_INFO(EventSource::AUTOSTEER, "KICKOUT: Cleared via guidance toggle");
+
+                // Reset encoder count
+                if (EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+                    EncoderProcessor::getInstance()->resetPulseCount();
+                    LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset for new engagement");
+                }
+            }
+        }
+    }
+
+    // Always update current angle reading (needed for PGN253 even when autosteer is off)
+    // Keya's CAN "curve" value is motor-side, not a real WAS, so for TractorCAN+Keya the wheel-angle
+    // source is an explicit user choice (Analog/CAN/Virtual, see keyaWasSource) instead of an automatic
+    // priority chain. Other CAN valve tractors do provide a real WAS over CAN and keep using it
+    // automatically whenever available.
+    uint8_t angleSource = 0;  // 0=analog, 1=fusion, 2=can-curve
+    bool isTractorCANKeya = false;
+    bool valveDataReceived = false;
+    uint8_t keyaWasSource = 0;  // 0=Analog, 1=CAN curve, 2=Virtual (fusion) - only used when isTractorCANKeya
+    if (motorPTR && motorPTR->getType() == MotorDriverType::TRACTOR_CAN) {
+        TractorCANDriver* tractorCAN = static_cast<TractorCANDriver*>(motorPTR);
+        isTractorCANKeya = (tractorCAN && tractorCAN->hasKeyaMotor());
+        valveDataReceived = (tractorCAN && tractorCAN->isValveDataReceived());
+        CANSteerConfig canConfig = configManager.getCANSteerConfig();
+        keyaWasSource = canConfig.reserved[0];
+
+        if (isTractorCANKeya) {
+            if (keyaWasSource == 2 && configManager.getINSUseFusion() && wheelAngleFusionPtr && wheelAngleFusionPtr->isHealthy()) {
+                currentAngle = wheelAngleFusionPtr->getFusedAngle();
+                angleSource = 1;
+            } else if (keyaWasSource == 1 && valveDataReceived) {
+                int16_t canCurve = tractorCAN->getActualCurve();
+                float scale = tractorCAN->getCurveScale();
+                currentAngle = (float)canCurve / scale;
+                angleSource = 2;
+            } else {
+                currentAngle = adProcessor.getWASAngle();
+                angleSource = 0;
+            }
+        } else if (tractorCAN && valveDataReceived) {
+            // Non-Keya tractor valve systems provide real WAS feedback over CAN
+            int16_t canCurve = tractorCAN->getActualCurve();
+            float scale = tractorCAN->getCurveScale();
+            currentAngle = (float)canCurve / scale;
+            angleSource = 2;
+        } else if (configManager.getINSUseFusion() && wheelAngleFusionPtr && wheelAngleFusionPtr->isHealthy()) {
+            currentAngle = wheelAngleFusionPtr->getFusedAngle();
+            angleSource = 1;
+        } else {
+            currentAngle = adProcessor.getWASAngle();
+            angleSource = 0;
+        }
+    } else if (configManager.getINSUseFusion() && wheelAngleFusionPtr && wheelAngleFusionPtr->isHealthy()) {
+        currentAngle = wheelAngleFusionPtr->getFusedAngle();
+        angleSource = 1;
+    } else {
+        currentAngle = adProcessor.getWASAngle();
+        angleSource = 0;
+    }
+
+    // AgOpenGPS's Zero-WAS button and Smart WAS auto-calibration are angle-source-agnostic on
+    // the PC side - they just nudge wasOffset/countsPerDegree (PGN252) until the reported steer
+    // angle reads ~0 while driving straight. ADProcessor already applies wasOffset internally for
+    // the analog path; CAN-curve and Virtual(Fusion) sources bypass ADProcessor entirely, so apply
+    // the same correction here to keep them calibratable from AgOpenGPS too.
+    if (angleSource != 0) {
+        float cpd = (float)configManager.getSteerSensorCounts();
+        if (cpd != 0.0f) {
+            currentAngle -= (float)configManager.getWasOffset() / cpd;
+        }
+    }
+
+    static uint8_t lastAngleSource = 255;
+    if (angleSource != lastAngleSource) {
+        lastAngleSource = angleSource;
+        const char* sourceName = (angleSource == 2) ? "CAN curve" :
+                                 (angleSource == 1) ? "Fusion" : "Analog WAS";
+        LOG_INFO(EventSource::AUTOSTEER,
+                 "Wheel angle source: %s (tractorCANKeya=%d, valveData=%d, keyaWasSource=%d)",
+                 sourceName,
+                 isTractorCANKeya ? 1 : 0,
+                 valveDataReceived ? 1 : 0,
+                 keyaWasSource);
+    }
+    
+    // Apply Ackerman fix to current angle if it's negative (left turn)
+    actualAngle = currentAngle;
+    if (actualAngle < 0) {
+        float ackermanFix = configManager.getAckermanFix();
+        actualAngle = actualAngle * ackermanFix;
+        
+        // Log Ackerman fix application periodically
+        static uint32_t lastAckermanLog = 0;
+        if (millis() - lastAckermanLog > 5000 && abs(actualAngle) > 1.0f) {
+            lastAckermanLog = millis();
+            LOG_DEBUG(EventSource::AUTOSTEER, "Ackerman fix applied: %.2f° * %.2f = %.2f°", 
+                     currentAngle, ackermanFix, actualAngle);
+        }
+    }
+    
+    // Update motor control
+    updateMotorControl();
+    
+    // Note: LOCK output is handled by motor driver enable pin (dual-purpose)
+    
+    // Update LED status - simple motor state tracking
+    bool motorActive = (motorState != MotorState::DISABLED);  // Check actual motor state
+
+    // Map motor state directly to LED state
+    LEDManagerFSM::SteerState ledState;
+    if (motorActive) {
+        ledState = LEDManagerFSM::STEER_ENGAGED;     // Green - motor running
+    } else {
+        ledState = LEDManagerFSM::STEER_READY;       // Amber - motor not running
+    }
+
+    // Debug logging for LED state
+    static LEDManagerFSM::SteerState lastLedState = LEDManagerFSM::STEER_READY;
+    if (ledState != lastLedState) {
+        LOG_INFO(EventSource::AUTOSTEER, "LED state change: motor=%s -> %s",
+                 motorActive ? "ACTIVE" : "DISABLED",
+                 ledState == LEDManagerFSM::STEER_READY ? "AMBER" : "GREEN");
+        lastLedState = ledState;
+    }
+    ledManagerFSM.transitionSteerState(ledState);
+}
+
+void AutosteerProcessor::handleBroadcastPGN(uint8_t pgn, const uint8_t* data, size_t len) {
+    // Check if this is a Hello PGN
+    if (pgn == 200) {
+        // PGN 200 - Hello from AgIO, send reply
+        sendHelloReply();
+    }
+    // Check if this is a Scan Request PGN
+    else if (pgn == 202) {
+        // PGN 202 - Scan request from AgIO
+        bool newFormat = PGNProcessor::instance ? PGNProcessor::instance->lastScanWasNewFormat : false;
+        sendScanReply(newFormat);
+    }
+}
+
+void AutosteerProcessor::sendHelloReply() {
+    // Hello from AutoSteer - PGN 126 (0x7E)
+    // Format: {header, source, pgn, length, angleLo, angleHi, countsLo, countsHi, switches, checksum}
+    
+    uint8_t helloFromSteer[] = {
+        128, 129,       // Header (0x80, 0x81)
+        126,            // Source: Steer module (0x7E)
+        126,            // PGN: Steer reply (0x7E)
+        5,              // Length
+        0, 0,           // Angle (0 for now)
+        0, 0,           // Counts (0 for now)
+        0,              // Switch byte (0 for now)
+        71              // Checksum (hardcoded like NG-V6)
+    };
+    
+    // Send via UDP
+    sendUDPbytes(helloFromSteer, sizeof(helloFromSteer));
+}
+
+void AutosteerProcessor::sendScanReply(bool extended) {
+    // Scan reply from AutoSteer - PGN 203 (0xCB)
+    // classic  (extended=false): 13-byte reply (AgIO < 5.8 compatibility)
+    // extended (extended=true) : 149-byte reply with shortname / longname / description
+
+    uint8_t ip[4];
+    configManager.getIPAddress(ip);
+
+    if (!extended) {
+        // Classic 13-byte PGN 203 for old AgIO compatibility
+        uint8_t scanReply[] = {
+            0x80, 0x81,                    // Header
+            0x7E,                          // Source: Steer module
+            0xCB,                          // PGN: 203 Scan reply
+            0x07,                          // Length (data only)
+            ip[0],        // IP octet 1
+            ip[1],        // IP octet 2
+            ip[2],        // IP octet 3
+            ip[3],        // IP octet 4
+            ip[0],        // Subnet octet 1 (repeat IP)
+            ip[1],        // Subnet octet 2 (repeat IP)
+            ip[2],        // Subnet octet 3 (repeat IP)
+            0                              // CRC placeholder
+        };
+        uint8_t crc = 0;
+        for (size_t i = 2; i < sizeof(scanReply) - 1; i++) crc += scanReply[i];
+        scanReply[sizeof(scanReply) - 1] = crc;
+        sendUDPbytes(scanReply, sizeof(scanReply));
+        // Also send extended so Bridge/PANDA module tables work with old AgIO
+    }
+    // Extended 149-byte PGN 203 (always sent)
+    {
+        uint8_t reply[149];
+        memset(reply, 0, sizeof(reply));
+        reply[0] = 0x80;
+        reply[1] = 0x81;
+        reply[2] = 0x7E;  // Source: Steer module
+        reply[3] = 0xCB;  // PGN 203
+        reply[4] = 143;   // dataLen
+        reply[5] = ip[0];
+        reply[6] = ip[1];
+        reply[7] = ip[2];
+        reply[8] = ip[3];
+        // bytes 9-15: zeros already
+        strncpy((char*)&reply[16], configManager.getModuleShortname(),   11); reply[27]  = '\0';
+        strncpy((char*)&reply[28], configManager.getModuleLongname(),    19); reply[47]  = '\0';
+        strncpy((char*)&reply[48], configManager.getModuleDescription(), 99); reply[147] = '\0';
+        uint8_t crc = 0;
+        for (int i = 2; i <= 147; i++) crc += reply[i];
+        reply[148] = crc;
+        sendUDPbytes(reply, sizeof(reply));
+    }
+}
+
+void AutosteerProcessor::handleSteerConfig(uint8_t pgn, const uint8_t* data, size_t len) {
+    // PGN 251 - Steer Config
+    // Expected length is 14 bytes total, but we get data after header
+    
+    LOG_DEBUG(EventSource::AUTOSTEER, "PGN 251 (Steer Config) received, %d bytes", len);
+    
+    // Clear any active kickout when steer config is received
+    // This happens when user clicks the test button in AgOpenGPS
+    if (kickoutMonitor && kickoutMonitor->hasKickout()) {
+        kickoutMonitor->clearKickout();
+        LOG_INFO(EventSource::AUTOSTEER, "KICKOUT: Cleared via steer config update");
+        
+        // Reset encoder count
+        if (EncoderProcessor::getInstance() && EncoderProcessor::getInstance()->isEnabled()) {
+            EncoderProcessor::getInstance()->resetPulseCount();
+            LOG_INFO(EventSource::AUTOSTEER, "Encoder count reset via steer config");
+        }
+    }
+    
+    // Always show debug info first, regardless of packet validity
+    char debugMsg[256];
+    snprintf(debugMsg, sizeof(debugMsg), "Raw PGN 251 data:");
+    for (int i = 0; i < len && strlen(debugMsg) < 200; i++) {
+        char buf[20];
+        snprintf(buf, sizeof(buf), " [%d]=0x%02X(%d)", i, data[i], data[i]);
+        strncat(debugMsg, buf, sizeof(debugMsg) - strlen(debugMsg) - 1);
+    }
+    LOG_DEBUG(EventSource::AUTOSTEER, "%s", debugMsg);
+    
+    if (len < 4) {  // Minimum needed for basic config
+        LOG_ERROR(EventSource::AUTOSTEER, "PGN 251 too short! Got %d bytes", len);
+        return;
+    }
+    
+    // Data array indices (after header/length removal):
+    // Per PGN.md: set0, pulseCount, minSpeed, sett1, ***, ***, ***, ***
+    // [0] = setting0 byte
+    // [1] = pulseCountMax
+    // [2] = minSpeed
+    // [3] = setting1 byte
+    // [4-7] = reserved/unused
+    
+    uint8_t sett0 = data[0];
+    bool invertWAS = bitRead(sett0, 0);
+    bool motorDriveDirection = bitRead(sett0, 2);
+    bool cytronDriver = bitRead(sett0, 4);
+    bool steerSwitch = bitRead(sett0, 5);
+    bool steerButton = bitRead(sett0, 6);
+    bool shaftEncoder = bitRead(sett0, 7);
+    
+    uint8_t pulseCountMax = data[1];  // Fixed: was data[2]
+    uint8_t minSpeed = data[2];       // Fixed: was data[3]
+    
+    uint8_t sett1 = data[3];              // Fixed: was data[4]
+    bool isDanfoss = bitRead(sett1, 0);
+    bool pressureSensor = bitRead(sett1, 1);
+    bool currentSensor = bitRead(sett1, 2);
+    bool isUseYAxis = bitRead(sett1, 3);
+    
+    // When current sensor is enabled, data[1] (pulseCountMax) is repurposed as current threshold
+    if (currentSensor) {
+        uint8_t currentThreshold = data[1];
+        LOG_INFO(EventSource::AUTOSTEER, "Current sensor enabled - threshold=%d (%.1f%%)", 
+                  currentThreshold, (currentThreshold * 100.0f) / 255.0f);
+        configManager.setCurrentThreshold(currentThreshold);
+    } else if (pressureSensor) {
+        // When pressure sensor is enabled, data[1] might be pressure threshold
+        uint8_t pressureThreshold = data[1];
+        LOG_INFO(EventSource::AUTOSTEER, "Pressure sensor enabled - threshold=%d (%.1f%%)", 
+                  pressureThreshold, (pressureThreshold * 100.0f) / 255.0f);
+        configManager.setPressureThreshold(pressureThreshold);
+    } else if (shaftEncoder) {
+        // When encoder is enabled, data[1] is pulse count max
+        LOG_INFO(EventSource::AUTOSTEER, "Shaft encoder enabled - pulseCountMax=%d", 
+                  pulseCountMax);
+    }
+    
+    // Read motor driver configuration from byte 8 of the message (data array index 3)
+    // Message structure: Header(5) + Data(8) + CRC(1) = 14 bytes total
+    // Byte 8 of the message = data[3] (since data array starts after 5-byte header)
+    uint8_t motorDriverConfig = data[3];
+    
+    // Workaround: Clear Cytron bit when Danfoss is selected
+    // AgOpenGPS doesn't always clear this bit when switching to Danfoss
+    if (isDanfoss || (motorDriverConfig & 0x01)) {
+        cytronDriver = false;
+    }
+    
+    // Update motor driver manager with new configuration
+    MotorDriverManager::getInstance()->updateMotorConfig(motorDriverConfig);
+    
+    LOG_DEBUG(EventSource::AUTOSTEER, "InvertWAS: %d", invertWAS);
+    LOG_DEBUG(EventSource::AUTOSTEER, "MotorDriveDirection: %d", motorDriveDirection);
+    LOG_DEBUG(EventSource::AUTOSTEER, "SteerSwitch: %d", steerSwitch);
+    LOG_DEBUG(EventSource::AUTOSTEER, "SteerButton: %d", steerButton);
+    LOG_DEBUG(EventSource::AUTOSTEER, "PulseCountMax: %d", pulseCountMax);
+    LOG_DEBUG(EventSource::AUTOSTEER, "MinSpeed: %d", minSpeed);
+    
+    // Determine motor type from config
+    const char* motorType = "Unknown";
+    switch (motorDriverConfig) {
+        case 0x00: motorType = cytronDriver ? "Cytron IBT2" : "DRV8701"; break;
+        case 0x01: motorType = "Danfoss"; break;
+        case 0x02: motorType = cytronDriver ? "Cytron IBT2" : "DRV8701"; break;
+        case 0x03: motorType = "Danfoss"; break;
+        case 0x04: motorType = cytronDriver ? "Cytron IBT2" : "DRV8701"; break;
+        default: motorType = "Unknown"; break;
+    }
+    
+    // Determine steer enable type
+    const char* steerType = "None";
+    if (steerButton) {
+        steerType = "Button";
+    } else if (steerSwitch) {
+        steerType = "Switch";
+    }
+    
+    // Log all settings at INFO level in a single message so users see everything
+    LOG_INFO(EventSource::AUTOSTEER, "Steer config: WAS=%s Motor=%s MinSpeed=%d Steer=%s Encoder=%s Pressure=%s Current=%s (max=%d) MotorType=%s", 
+             invertWAS ? "Inv" : "Norm",
+             motorDriveDirection ? "Rev" : "Norm",
+             minSpeed,
+             steerType,
+             shaftEncoder ? "Yes" : "No",
+             pressureSensor ? "Yes" : "No",
+             currentSensor ? "Yes" : "No",
+             pulseCountMax,
+             motorType);
+             
+    // Additional debug for encoder configuration
+    LOG_DEBUG(EventSource::AUTOSTEER, "Encoder Debug: ShaftEncoder=%d, IsDanfoss=%d, MotorConfig=0x%02X, MotorType=%s",
+             shaftEncoder, isDanfoss, motorDriverConfig, motorType);
+    
+    
+    // Save config to EEPROM
+    configManager.setInvertWAS(invertWAS);
+    configManager.setMotorDriveDirection(motorDriveDirection);
+    configManager.setCytronDriver(cytronDriver);
+    configManager.setSteerSwitch(steerSwitch);
+    configManager.setSteerButton(steerButton);
+    configManager.setShaftEncoder(shaftEncoder);
+    configManager.setPressureSensor(pressureSensor);
+    configManager.setCurrentSensor(currentSensor);
+    configManager.setPulseCountMax(pulseCountMax);
+    configManager.setMinSpeed(minSpeed);
+    configManager.setMotorDriverConfig(motorDriverConfig);
+    configManager.setIsUseYAxis(isUseYAxis);  // Save Y-axis swap setting for IMU
+    
+    // Note: Sensor configuration updates would go here if we want dynamic changes
+    // For now, sensor changes require reboot to ensure clean state
+    
+    // Check for motor type changes
+    bool motorTypeChanged = false;
+    int8_t currentCytronDriver = cytronDriver ? 1 : 0;
+    
+    // Only check for changes if we've initialized from EEPROM
+    if (motorConfigInitialized) {
+        LOG_DEBUG(EventSource::AUTOSTEER, "Current motor state: Config=0x%02X, Cytron=%d (previous: Config=0x%02X, Cytron=%d)",
+                  motorDriverConfig, currentCytronDriver,
+                  previousMotorConfig, previousCytronDriver);
+        
+        // Only check motor-relevant bits (bit 0 = Danfoss, CytronDriver is separate)
+        // Ignore sensor bits (bits 1-2) when checking for motor changes
+        uint8_t previousMotorBits = previousMotorConfig & 0x01;  // Danfoss bit only
+        uint8_t currentMotorBits = motorDriverConfig & 0x01;
+        
+        if (previousMotorBits != currentMotorBits ||
+            previousCytronDriver != currentCytronDriver) {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor change detected: Danfoss %d->%d, Cytron %d->%d",
+                     previousMotorBits, currentMotorBits,
+                     previousCytronDriver, currentCytronDriver);
+            motorTypeChanged = true;
+        }
+    } else {
+        // First PGN 251 received, but we should already be initialized from init()
+        LOG_WARNING(EventSource::AUTOSTEER, "Motor config not initialized - this shouldn't happen!");
+    }
+    
+    // Update tracked values
+    previousMotorConfig = motorDriverConfig;
+    previousCytronDriver = currentCytronDriver;
+    
+    configManager.saveSteerConfig();
+    configManager.saveTurnSensorConfig();  // Also save turn sensor config (includes current threshold)
+    LOG_INFO(EventSource::AUTOSTEER, "Steer config saved to EEPROM");
+
+    // Apply encoder settings if changed
+    if (EncoderProcessor::getInstance()) {
+        bool currentEncoderEnabled = EncoderProcessor::getInstance()->isEnabled();
+
+        // Update encoder enable state if changed
+        if (currentEncoderEnabled != shaftEncoder) {
+            EncoderProcessor::getInstance()->updateConfig(
+                (EncoderType)configManager.getEncoderType(), shaftEncoder);
+            LOG_INFO(EventSource::AUTOSTEER, "Encoder %s via PGN 251", shaftEncoder ? "enabled" : "disabled");
+        }
+    }
+
+
+    if (motorTypeChanged) {
+        LOG_WARNING(EventSource::AUTOSTEER, "Motor type changed - rebooting in 2 seconds...");
+        delay(2000);
+        SCB_AIRCR = 0x05FA0004; // Teensy Reset
+    }
+}
+
+void AutosteerProcessor::handleSteerSettings(uint8_t pgn, const uint8_t* data, size_t len) {
+    // PGN 252 - Steer Settings
+    // Expected length is 14 bytes total, but we get data after header
+    
+    LOG_DEBUG(EventSource::AUTOSTEER, "PGN 252 (Steer Settings) received, %d bytes", len);
+    
+    if (len < 8) {
+        LOG_ERROR(EventSource::AUTOSTEER, "PGN 252 too short!");
+        return;
+    }
+    
+    // Parse PGN 252 data directly to local variables
+    uint8_t kp = data[0];
+    uint8_t highPWM = data[1];
+    // data[2] is lowPWM — sent by AgOpenGPS but unused in steering logic
+    uint8_t minPWM = data[3];
+    uint8_t steerSensorCounts = data[4];
+    int16_t wasOffset = data[5] | (data[6] << 8);
+    float ackermanFix = (float)data[7] * 0.01f;
+
+    LOG_INFO(EventSource::AUTOSTEER, "Steer settings: Kp=%d PWM min=%d high=%d WAS_offset=%d counts=%d Ackerman=%.2f",
+             kp, minPWM, highPWM, wasOffset, steerSensorCounts, ackermanFix);
+
+    adProcessor.setWASOffset(wasOffset);
+    adProcessor.setWASCountsPerDegree(steerSensorCounts);
+
+    // Save steer settings to ConfigManager
+    configManager.setKp(kp);
+    configManager.setHighPWM(highPWM);
+    configManager.setMinPWM(minPWM);
+    configManager.setSteerSensorCounts(steerSensorCounts);
+    configManager.setWasOffset(wasOffset);
+    configManager.setAckermanFix(ackermanFix);
+    configManager.saveSteerSettings();
+    LOG_INFO(EventSource::AUTOSTEER, "Steer settings saved to EEPROM");
+
+    // Log confirmation that settings are now active
+    LOG_INFO(EventSource::AUTOSTEER, "Settings now active - no reboot required. Motor will use new PWM values immediately.");
+}
+
+void AutosteerProcessor::handleSteerData(uint8_t pgn, const uint8_t* data, size_t len) {
+    // PGN 254 - Steer Data (comes at 10Hz from AgOpenGPS)
+    // For now, we only care about the autosteer enable bit
+    
+    if (len < 3) {
+        LOG_DEBUG(EventSource::AUTOSTEER, "PGN 254 too short, ignoring");
+        return;  // Too short, ignore
+    }
+    
+    // Check if we're recovering from a link down event
+    static uint32_t linkUpTime = 0;
+    static bool waitingForStableLink = false;
+    
+    if (linkWasDown) {
+        // Link was down, now we're receiving PGN 254 again
+        linkUpTime = millis();
+        waitingForStableLink = true;
+        linkWasDown = false;  // Clear the flag
+    }
+    
+    // Wait 3 seconds for network negotiation after link restoration
+    if (waitingForStableLink && (millis() - linkUpTime > 3000)) {
+        LOG_INFO(EventSource::AUTOSTEER, "Communication restored - motor under AOG control");
+        waitingForStableLink = false;
+    }
+    
+    lastPGN254Time = millis();
+    lastCommandTime = millis();  // Update watchdog timer
+    
+    // Debug: Log raw PGN 254 data
+    // Data format (from PGNProcessor we get data starting at speed):
+    // [0-1] = Speed (uint16, 0.1 km/h resolution)
+    // [2] = Status byte
+    //       Bit 0: Guidance active
+    //       Bit 6: Autosteer enable (this is what we need for button)
+    // [3-4] = Steer angle setpoint (int16, divide by 100 for degrees)
+    // [5] = XTE (cross track error)
+    // [6] = Machine sections 1-8
+    // [7] = Machine sections 9-16
+    
+    // Extract speed
+    vehicleSpeed = (uint16_t)(data[1] << 8 | data[0]) * 0.1f; // Convert to km/h
+    
+    // Extract status
+    uint8_t status = data[2];
+    // Track guidance status changes
+    static bool firstBroadcast = true;
+    bool newGuidanceActive = (status & 0x01) != 0;   // Bit 0 is guidance active
+    
+    if (firstBroadcast) {
+        // On first broadcast, just set the status without triggering change
+        guidanceActive = newGuidanceActive;
+        prevGuidanceStatus = newGuidanceActive;
+        guidanceStatusChanged = false;
+        firstBroadcast = false;
+    } else {
+        // Normal operation - detect changes
+        prevGuidanceStatus = guidanceActive;
+        guidanceActive = newGuidanceActive;
+        guidanceStatusChanged = (guidanceActive != prevGuidanceStatus);
+    }
+    // Extract steer angle
+    int16_t angleRaw = (int16_t)(data[4] << 8 | data[3]);
+    targetAngle = angleRaw / 100.0f;
+    
+    // Debug log for AgIO test mode
+    if (targetAngle != 0.0f || autosteerEnabled) {
+        LOG_DEBUG(EventSource::AUTOSTEER, "PGN254: speed=%.1f km/h, target=%.1f°, enabled=%d, guidance=%d", 
+                  vehicleSpeed, targetAngle, autosteerEnabled, guidanceActive);
+    }
+    
+    // Extract XTE
+    crossTrackError = (int8_t)data[5];
+    
+    // Extract sections
+    uint8_t sections1_8 = data[6];
+    uint8_t sections9_16 = data[7];
+    machineSections = (uint16_t)(sections9_16 << 8 | sections1_8);
+
+    autosteerEnabled = (status & 0x40) != 0;  // Bit 6 is autosteer enable
+
+    // Send PGN 253 status 1:1 with each PGN254 received from AgOpenGPS
+    sendPGN253();
+}
+
+// Static callback wrapper
+void AutosteerProcessor::handlePGNStatic(uint8_t pgn, const uint8_t* data, size_t len) {
+    if (instance) {
+        // Don't print for PGN 254, 200, or 202 since they come frequently
+        if (pgn != 254 && pgn != 200 && pgn != 202) {
+            LOG_DEBUG(EventSource::AUTOSTEER, "Received PGN %d", pgn);
+        }
+        
+        // Handle broadcast PGNs
+        if (pgn == 200 || pgn == 202) {
+            instance->handleBroadcastPGN(pgn, data, len);
+        }
+        else if (pgn == 251) {
+            instance->handleSteerConfig(pgn, data, len);
+        }
+        else if (pgn == 252) {
+            instance->handleSteerSettings(pgn, data, len);
+        }
+        else if (pgn == 254) {
+            instance->handleSteerData(pgn, data, len);
+        }
+        // We'll add other PGNs one at a time as needed
+    } else {
+        LOG_ERROR(EventSource::AUTOSTEER, "No instance!");
+    }
+}
+
+void AutosteerProcessor::sendPGN253() {
+    // PGN 253 - Status data TO AgOpenGPS
+    // Format: {header, source, pgn, length, 
+    //          steerAngleLo, steerAngleHi,    // bytes 5-6: actual steer angle
+    //          headingLo, headingHi,           // bytes 7-8: IMU heading (deprecated)
+    //          rollLo, rollHi,                 // bytes 9-10: roll (deprecated)
+    //          switchByte,                     // byte 11: switch states
+    //          pwmDisplay,                     // byte 12: PWM value
+    //          checksum}
+    
+    // Get actual values - use actualAngle which includes Ackerman correction
+    int16_t actualSteerAngle = (int16_t)(actualAngle * 100.0f);  // Actual angle * 100
+    int16_t heading = 0;            // Deprecated - sent by GNSS
+    int16_t roll = 0;               // Deprecated - sent by GNSS  
+    uint8_t livePwmDisplay = (uint8_t)abs(motorPWM);  // Already in 0-255 range
+    bool kickoutActiveNow = (kickoutMonitor && kickoutMonitor->hasKickout());
+
+    // Freeze PWM telemetry at kickout so AgOpenGPS can display the causal value briefly.
+    if (kickoutActiveNow && !lastKickoutStateForTelemetry) {
+        frozenPwmDisplay = livePwmDisplay;
+        pwmFreezeStartTime = millis();
+    }
+    lastKickoutStateForTelemetry = kickoutActiveNow;
+
+    bool inPostKickoutWindow = (pwmFreezeStartTime != 0) &&
+                               ((uint32_t)(millis() - pwmFreezeStartTime) < POST_KICKOUT_TELEMETRY_MS);
+    uint8_t pwmDisplay = (kickoutActiveNow || inPostKickoutWindow) ? frozenPwmDisplay : livePwmDisplay;
+    
+    // Build switch byte
+    // Bit 0: work switch (inverted)
+    // Bit 1: steer switch (inverted steerState)
+    // Bit 2: remote/kickout input
+    // Bit 3: unused
+    // Bit 4: unused
+    // Bit 5: fusion active (1 = fusion, 0 = WAS)
+    uint8_t switchByte = 0;
+    switchByte |= (0 << 2);        // No remote/kickout for now
+    switchByte |= (steerState << 1);  // Steer state in bit 1
+    switchByte |= !adProcessor.isWorkSwitchOn();  // Work switch state (inverted) in bit 0
+    
+    uint8_t pgn253[] = {
+        0x80, 0x81,                    // Header
+        0x7E,                          // Source: Steer module (126)
+        0xFD,                          // PGN: 253
+        8,                             // Length
+        (uint8_t)(actualSteerAngle & 0xFF),      // Steer angle low
+        (uint8_t)(actualSteerAngle >> 8),        // Steer angle high
+        (uint8_t)(heading & 0xFF),                // Heading low
+        (uint8_t)(heading >> 8),                  // Heading high
+        (uint8_t)(roll & 0xFF),                   // Roll low
+        (uint8_t)(roll >> 8),                     // Roll high
+        switchByte,                               // Switch byte
+        pwmDisplay,                               // PWM display
+        0                                         // CRC placeholder
+    };
+    
+    // Calculate CRC
+    uint8_t crc = 0;
+    for (int i = 2; i < sizeof(pgn253) - 1; i++) {
+        crc += pgn253[i];
+    }
+    pgn253[sizeof(pgn253) - 1] = crc;
+    
+    // Send via UDP
+    sendUDPbytes(pgn253, sizeof(pgn253));
+}
+
+void AutosteerProcessor::updateMotorControl() {
+    // Current angle is now updated in process() before this function is called
+    
+    // Check if steering should be active
+    bool shouldBeActive = shouldSteerBeActive();
+    
+    // Handle state transitions
+    if (shouldBeActive && motorState == MotorState::DISABLED) {
+        // Transition: Start soft-start sequence
+        motorState = MotorState::SOFT_START;
+        softStartBeginTime = millis();
+        softStartRampValue = 0.0f;
+        filteredCommandPwm = 0.0f;  // Reset filter so it doesn't start from a stale value
+        LOG_INFO(EventSource::AUTOSTEER, "Motor STARTING - soft-start sequence (%dms)",
+                 softStartDurationMs);
+        // Update LED immediately
+        ledManagerFSM.transitionSteerState(LEDManagerFSM::STEER_ENGAGED);
+        LOG_INFO(EventSource::AUTOSTEER, "LED -> GREEN (motor starting)");
+    } 
+    else if (!shouldBeActive && motorState != MotorState::DISABLED) {
+        // Transition: Disable motor
+        motorState = MotorState::DISABLED;
+        motorPWM = 0;
+        filteredCommandPwm = 0.0f;
+        if (motorPTR) {
+            motorPTR->enable(false);
+            motorPTR->setPWM(0);
+
+            // LOCK output control
+            if (motorPTR->getType() == MotorDriverType::KEYA_CAN) {
+                // Directly control LOCK output for Keya motor
+                digitalWrite(4, LOW);  // SLEEP_PIN = 4, LOW = LOCK OFF
+                LOG_INFO(EventSource::AUTOSTEER, "LOCK output: INACTIVE (pin 4 LOW for Keya motor)");
+            } else {
+                // For PWM motors, pin 4 is controlled by the motor driver
+                LOG_INFO(EventSource::AUTOSTEER, "LOCK output: INACTIVE (motor disabled)");
+            }
+        }
+        // Update LED immediately when motor disabled
+        ledManagerFSM.transitionSteerState(LEDManagerFSM::STEER_READY);
+        LOG_INFO(EventSource::AUTOSTEER, "LED -> AMBER (motor disabled)");
+
+        // Give more specific disable reason
+        if (!QNetworkBase::isConnected()) {
+            // Already logged in link state change detection above
+        } else if (vehicleSpeed <= 0.1f) {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor disabled - speed too low (%.1f km/h)", vehicleSpeed);
+        } else if (!guidanceActive) {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor disabled - guidance inactive");
+        } else if (steerState != 0) {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor disabled - steer switch off");
+        } else if (millis() - lastCommandTime > WATCHDOG_TIMEOUT) {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor disabled - communication timeout");
+        } else {
+            LOG_INFO(EventSource::AUTOSTEER, "Motor disabled");
+        }
+        return;
+    }
+    else if (!shouldBeActive) {
+        // Already disabled, nothing to do
+        return;
+    }
+    
+    // Ackerman fix is now applied in process() before this function is called
+    
+    // Calculate angle error
+    float angleError = actualAngle - targetAngle;
+
+    // Get PWM settings from ConfigManager (cached for performance)
+    uint8_t kp = configManager.getKp();
+    uint8_t highPWM = configManager.getHighPWM();
+    uint8_t minPWM = configManager.getMinPWM();
+
+    // Debug log to verify settings are being read
+    static uint32_t lastSettingsVerifyLog = 0;
+    static uint8_t lastKp = 0;
+    static uint8_t lastHighPWM = 0;
+    if (millis() - lastSettingsVerifyLog > 5000 || kp != lastKp || highPWM != lastHighPWM) {
+        lastSettingsVerifyLog = millis();
+        lastKp = kp;
+        lastHighPWM = highPWM;
+        LOG_INFO(EventSource::AUTOSTEER, "Active PWM settings: Kp=%d, highPWM=%d, minPWM=%d", kp, highPWM, minPWM);
+    }
+    
+    // Calculate base PWM output (error * Kp)
+    int16_t pValue = kp * angleError;
+    
+    // Apply PWM calculation similar to V6
+    if (highPWM > 0) {  // Check if we have valid settings
+        // Start with base P value
+        int16_t pwmDrive = pValue;
+        
+        // Add min throttle factor so no delay from motor resistance
+        if (pwmDrive < 0) {
+            pwmDrive -= minPWM;
+        } else if (pwmDrive > 0) {
+            pwmDrive += minPWM;
+        } else {
+            // Dead zone - set pwmDrive to 0
+            pwmDrive = 0;
+        }
+        
+        // Limit the PWM drive to highPWM setting
+        if (pwmDrive > highPWM) {
+            pwmDrive = highPWM;
+        } else if (pwmDrive < -highPWM) {
+            pwmDrive = -highPWM;
+        }
+
+        // Check for hard acceleration - soften if needed
+        // Use lastPwmDrive (pre-ramp, pre-inversion) so the check is not corrupted by the ramp value or direction inversion
+        uint8_t accelThreshold = (uint8_t)((highPWM - minPWM) * ACCEL_THRESHOLD_RATIO);
+        if ((abs(pwmDrive) > (highPWM - accelThreshold)) &&
+            (abs(lastPwmDrive) < (minPWM + accelThreshold)) &&
+            (motorState == MotorState::NORMAL_CONTROL)) {
+            motorState = MotorState::SOFT_ACCEL;
+            softStartBeginTime = millis();
+            LOG_DEBUG(EventSource::AUTOSTEER, "Hard acceleration detected - entering soft accel mode");
+        }
+
+        // Check for direction change - if so, enter soft-start again
+        // Use lastPwmDrive (pre-ramp, pre-inversion) to avoid false triggers from ramp or motorDriveDirection inversion
+        if (((lastPwmDrive > 0 && pwmDrive < 0) || (lastPwmDrive < 0 && pwmDrive > 0)) &&
+            (abs(pwmDrive) > (minPWM + DIRECTION_CHANGE_THRESHOLD)) &&
+            (motorState == MotorState::NORMAL_CONTROL)) {
+            motorState = MotorState::SOFT_START;
+            softStartBeginTime = millis();
+            filteredCommandPwm = 0.0f;  // Reset filter on direction change
+            LOG_DEBUG(EventSource::AUTOSTEER, "Direction change detected - entering soft start mode");
+        }
+
+        // Store final PWM value and save raw pwmDrive for next cycle's direction/accel checks
+        // lastPwmDrive is saved BEFORE ramp and BEFORE motorDriveDirection inversion
+        lastPwmDrive = pwmDrive;
+        motorPWM = pwmDrive;
+        
+        // Log the PWM calculation periodically
+        static uint32_t lastPWMCalcLog = 0;
+        if (millis() - lastPWMCalcLog > 5000) {  // Every 5 seconds
+            lastPWMCalcLog = millis();
+            LOG_DEBUG(EventSource::AUTOSTEER, "PWM calc: actual=%.1f° - target=%.1f° = error=%.1f° * Kp=%d = %d, +minPWM=%d, limit=%d, final=%d", 
+                     actualAngle, targetAngle, angleError, kp, pValue, minPWM, highPWM, pwmDrive);
+        }
+        
+        // Debug log final motor PWM periodically
+        static uint32_t lastMotorPWMLog = 0;
+        if (millis() - lastMotorPWMLog > 1000 && abs(motorPWM) > 10) {
+            lastMotorPWMLog = millis();
+            LOG_DEBUG(EventSource::AUTOSTEER, "Motor PWM: %d (highPWM=%d)", 
+                      motorPWM, highPWM);
+        }
+        
+        // Apply soft ramp if active (soft-start or soft-accel)
+        if (motorState == MotorState::SOFT_START || motorState == MotorState::SOFT_ACCEL) {
+            uint32_t elapsed = millis() - softStartBeginTime;
+            uint16_t durationMs = (motorState == MotorState::SOFT_START) ?
+                                  softStartDurationMs : softAccelDurationMs;
+            const char* modeName = (motorState == MotorState::SOFT_START) ?
+                                  "Soft-start" : "Soft-accel";
+
+            if (elapsed >= durationMs) {
+                // Ramp complete, transition to normal
+                motorState = MotorState::NORMAL_CONTROL;
+                LOG_INFO(EventSource::AUTOSTEER, "%s complete - normal steering control", modeName);
+            } else {
+                // Calculate ramp progress (0.0 to 1.0)
+                float rampProgress = (float)elapsed / (float)durationMs;
+
+                // Apply ramp function based on configuration
+                float rampValue;
+                if (useSineRamp) {
+                    // Use sine curve for smooth acceleration (slow-fast-slow)
+                    rampValue = sin(rampProgress * PI / 2.0f);
+                } else {
+                    // Use linear ramp
+                    rampValue = rampProgress;
+                }
+
+                // Apply ramp to motor PWM
+                int16_t originalPWM = motorPWM;
+                motorPWM = (int16_t)((float)motorPWM * rampValue);
+                // Note: no minPWM clamping here - pwmDrive already includes minPWM,
+                // so the ramp naturally passes through minPWM proportionally.
+                // Clamping would bypass the smooth ramp from 0.
+
+                softStartRampValue = rampValue;
+
+                // Debug logging every 50ms during ramp
+                static uint32_t lastRampDebug = 0;
+                if (millis() - lastRampDebug > 50) {
+                    lastRampDebug = millis();
+                    LOG_DEBUG(EventSource::AUTOSTEER, "%s: elapsed=%dms, progress=%.2f, ramp=%.2f, pwm=%d->%d",
+                              modeName, elapsed, rampProgress, rampValue, originalPWM, motorPWM);
+                }
+            }
+        }
+    } else {
+        // No valid PWM config
+        motorPWM = 0;
+        LOG_ERROR(EventSource::AUTOSTEER, "Invalid PWM configuration");
+    }
+    
+    // Apply motor direction from config
+    if (configManager.getMotorDriveDirection()) {
+        motorPWM = -motorPWM;  // Invert if configured
+    }
+
+    int16_t filteredMotorPwm = motorPWM;
+    if (motorState == MotorState::NORMAL_CONTROL) {
+        // Apply low-pass filter and minimum threshold only in normal control
+        float alpha = configManager.getPwmFilterAlpha() / 100.0f;
+        if (alpha > 0.97f) alpha = 0.97f;
+        filteredCommandPwm = alpha * filteredCommandPwm + (1.0f - alpha) * (float)motorPWM;
+        float threshold = (float)configManager.getMinPWM() * configManager.getPwmMinThresholdPct() / 100.0f;
+        if (fabsf(filteredCommandPwm) < threshold) {
+            filteredMotorPwm = 0;
+        } else {
+            filteredMotorPwm = (int16_t)constrain((int)filteredCommandPwm, -255, 255);
+        }
+    } else {
+        // During soft-start / soft-accel: bypass filter, use ramp PWM directly
+        // and keep filteredCommandPwm in sync so normal control starts smoothly
+        filteredCommandPwm = (float)motorPWM;
+    }
+    
+    // Send to motor
+    if (motorPTR) {
+        // Only enable motor if not in disabled state
+        if (motorState != MotorState::DISABLED) {
+            motorPTR->enable(true);
+            motorPTR->setPWM(filteredMotorPwm);
+            
+            // Debug log to confirm PWM is being sent
+            static uint32_t lastMotorCmdLog = 0;
+            if (millis() - lastMotorCmdLog > 1000) {
+                lastMotorCmdLog = millis();
+                LOG_DEBUG(EventSource::AUTOSTEER, "Sending to motor: rawPWM=%d filteredPWM=%d State=%d", 
+                          motorPWM, filteredMotorPwm, (int)motorState);
+            }
+        }
+        
+        // LOCK output control
+        // For PWM motors, pin 4 is controlled by the motor driver
+        // For Keya/CAN motors, we need to control pin 4 directly
+        if (motorPTR->getType() == MotorDriverType::KEYA_CAN) {
+            // Directly control LOCK output for Keya motor
+            digitalWrite(4, HIGH);  // SLEEP_PIN = 4, HIGH = LOCK ON
+            
+            static bool lockLogged = false;
+            if (motorState == MotorState::NORMAL_CONTROL && !lockLogged) {
+                LOG_INFO(EventSource::AUTOSTEER, "LOCK output: ACTIVE (pin 4 HIGH for Keya motor)");
+                lockLogged = true;
+            } else if (motorState == MotorState::DISABLED) {
+                lockLogged = false;
+            }
+        }
+    }
+    
+}
+
+bool AutosteerProcessor::shouldSteerBeActive() const {
+    // Check kickout cooldown
+    if (kickoutTime > 0 && (millis() - kickoutTime < KICKOUT_COOLDOWN_MS)) {
+        return false;  // Still in cooldown
+    }
+    
+    // Check ethernet link
+    if (!QNetworkBase::isConnected()) {
+        return false;  // No ethernet link
+    }
+    
+    // Check watchdog timeout
+    if (millis() - lastCommandTime > WATCHDOG_TIMEOUT) {
+        return false;  // No recent commands
+    }
+    
+    // Check all enable conditions
+    // Note: We use guidanceActive (bit 0) and steerState instead of autosteerEnabled (bit 6)
+    // because AgOpenGPS may not set bit 6 until it receives confirmation from us
+    bool active = guidanceActive &&           // Guidance line active (bit 0 from PGN 254)
+                  (steerState == 0) &&        // Our button/OSB state (0=active)
+                  (vehicleSpeed > (configManager.getMinSpeed() / 10.0f));  // Moving (MinSpeed is in 0.1 km/h units)
+    
+    // Debug logging for test mode
+    static uint32_t lastDebugTime = 0;
+    if (millis() - lastDebugTime > 1000) {
+        lastDebugTime = millis();
+        LOG_DEBUG(EventSource::AUTOSTEER, "shouldSteerBeActive: guidance=%d, steerState=%d, speed=%.1f -> %s",
+                  guidanceActive, steerState, vehicleSpeed, active ? "YES" : "NO");
+    }
+    
+    return active;
+}
+
+void AutosteerProcessor::emergencyStop() {
+    LOG_WARNING(EventSource::AUTOSTEER, "EMERGENCY STOP");
+    
+    // Reset motor state
+    motorState = MotorState::DISABLED;
+    filteredCommandPwm = 0.0f;
+    
+    // Disable motor immediately
+    motorPWM = 0;
+    if (motorPTR) {
+        motorPTR->setPWM(0);
+        motorPTR->enable(false);
+        
+        // Ensure LOCK is OFF on kickout
+        if (motorPTR->getType() == MotorDriverType::KEYA_CAN) {
+            digitalWrite(4, LOW);  // SLEEP_PIN = 4, LOW = LOCK OFF
+        }
+    }
+    
+    // Set inactive state
+    steerState = 1;
+    
+    // Start kickout cooldown
+    kickoutTime = millis();
+}
+
+// ============================================================================
+// VWAS endstop calibration sweep
+// ============================================================================
+// Drives the motor slowly to each mechanical stop, reusing the existing
+// KickoutMonitor slip/current detection (the same mechanism that normally
+// triggers an emergency stop) to recognise when a stop has been reached.
+// This is deliberately simple/conservative: low PWM, generous timeout,
+// refuses to start while guidance is active, and takes exclusive control
+// of the motor (see the early-return in process()) so it can never
+// interact with the normal PID/button logic.
+
+void AutosteerProcessor::processVWASCalibration() {
+    if (!motorPTR || !wheelAngleFusionPtr) {
+        vwasCalibState = VWASCalibState::ABORTED;
+        return;
+    }
+
+    // Kickout detection normally runs as part of the code path we bypass
+    // here (see the early return in process()) - run it explicitly.
+    if (kickoutMonitor) {
+        kickoutMonitor->process();
+    }
+
+    uint32_t now = millis();
+    uint32_t elapsed = now - vwasCalibStateStartTime;
+
+    switch (vwasCalibState) {
+        case VWASCalibState::SWEEP_LEFT:
+            motorPTR->enable(true);
+            motorPTR->setPWM(-VWAS_CALIB_SWEEP_PWM);
+            motorPWM = -VWAS_CALIB_SWEEP_PWM;
+            if (kickoutMonitor && kickoutMonitor->hasKickout()) {
+                vwasCalibLeftAngle = wheelAngleFusionPtr->getEncoderAngle();
+                motorPTR->setPWM(0);
+                kickoutMonitor->clearKickout();
+                LOG_INFO(EventSource::AUTOSTEER, "VWAS calib: left stop found at %.2f deg",
+                         vwasCalibLeftAngle);
+                vwasCalibState = VWASCalibState::PAUSE_AT_LEFT;
+                vwasCalibStateStartTime = now;
+            } else if (elapsed > VWAS_CALIB_TIMEOUT_MS) {
+                LOG_ERROR(EventSource::AUTOSTEER, "VWAS calib: timeout finding left stop - aborting");
+                vwasAbortCalibration();
+            }
+            break;
+
+        case VWASCalibState::PAUSE_AT_LEFT:
+            motorPTR->setPWM(0);
+            if (elapsed > VWAS_CALIB_PAUSE_MS) {
+                vwasCalibState = VWASCalibState::SWEEP_RIGHT;
+                vwasCalibStateStartTime = now;
+            }
+            break;
+
+        case VWASCalibState::SWEEP_RIGHT:
+            motorPTR->enable(true);
+            motorPTR->setPWM(VWAS_CALIB_SWEEP_PWM);
+            motorPWM = VWAS_CALIB_SWEEP_PWM;
+            if (kickoutMonitor && kickoutMonitor->hasKickout()) {
+                vwasCalibRightAngle = wheelAngleFusionPtr->getEncoderAngle();
+                motorPTR->setPWM(0);
+                kickoutMonitor->clearKickout();
+                LOG_INFO(EventSource::AUTOSTEER, "VWAS calib: right stop found at %.2f deg",
+                         vwasCalibRightAngle);
+                vwasCalibState = VWASCalibState::PAUSE_AT_RIGHT;
+                vwasCalibStateStartTime = now;
+            } else if (elapsed > VWAS_CALIB_TIMEOUT_MS) {
+                LOG_ERROR(EventSource::AUTOSTEER, "VWAS calib: timeout finding right stop - aborting");
+                vwasAbortCalibration();
+            }
+            break;
+
+        case VWASCalibState::PAUSE_AT_RIGHT: {
+            motorPTR->setPWM(0);
+            if (elapsed > VWAS_CALIB_PAUSE_MS) {
+                float measuredSwing = fabs(vwasCalibRightAngle - vwasCalibLeftAngle);
+                float centerAngle = (vwasCalibLeftAngle + vwasCalibRightAngle) / 2.0f;
+
+                // Note: this assumes a roughly symmetric lock-to-lock swing.
+                // Real Ackermann geometry is often slightly asymmetric
+                // (inner wheel turns more than outer) - this gives a good
+                // working approximation, not a perfect calibration.
+                float trueSwing = 2.0f * wheelAngleFusionPtr->getConfig().maxSteeringAngle;
+                wheelAngleFusionPtr->recalibrateCountsPerDegree(measuredSwing, trueSwing);
+                wheelAngleFusionPtr->setEncoderOffsetDirect(centerAngle);
+
+                LOG_INFO(EventSource::AUTOSTEER,
+                         "VWAS calib DONE: left=%.2f right=%.2f measuredSwing=%.2f trueSwing=%.2f "
+                         "center=%.2f newCountsPerDegree=%.2f",
+                         vwasCalibLeftAngle, vwasCalibRightAngle, measuredSwing, trueSwing,
+                         centerAngle, wheelAngleFusionPtr->getConfig().countsPerDegree);
+
+                // countsPerDegree is a mechanical ratio (linkage/gear) - it
+                // stays valid across power cycles, so persist it. The
+                // centre/offset we just set is NOT part of this saved
+                // config and is deliberately session-only: the Keya's own
+                // position counter resets to 0 on every power-up (wheels
+                // not necessarily straight at that point), so the centre
+                // must always be re-established fresh after each boot -
+                // either via a fresh sweep or the quick "Geradeausstellung
+                // setzen" button.
+                saveVWASConfig();
+
+                {
+                    char msg[80];
+                    snprintf(msg, sizeof(msg),
+                             "VWAS Kalib fertig: CPD=%.1f Mitte=%.2f Grad",
+                             wheelAngleFusionPtr->getConfig().countsPerDegree, centerAngle);
+                    MessageBuilder::sendHardwarePopup(msg, 8, 0);
+                }
+
+                motorPTR->setPWM(0);
+                motorPTR->enable(false);
+                motorPWM = 0;
+                vwasCalibState = VWASCalibState::DONE;
+            }
+            break;
+        }
+
+        default:
+            motorPTR->setPWM(0);
+            motorPTR->enable(false);
+            motorPWM = 0;
+            break;
+    }
+}
+
+bool AutosteerProcessor::vwasSetCenterNow() {
+    if (!wheelAngleFusionPtr) {
+        LOG_ERROR(EventSource::AUTOSTEER, "VWAS: cannot set centre - fusion not active");
+        return false;
+    }
+    wheelAngleFusionPtr->setEncoderCenter();
+    LOG_INFO(EventSource::AUTOSTEER, "VWAS: centre set via web UI button");
+    MessageBuilder::sendHardwarePopup("VWAS: Geradeausstellung gesetzt", 4, 0);
+    return true;
+}
+
+bool AutosteerProcessor::vwasStartEndstopCalibration() {
+    if (!motorPTR || !wheelAngleFusionPtr) {
+        LOG_ERROR(EventSource::AUTOSTEER, "VWAS calib: motor or fusion not available");
+        return false;
+    }
+    if (steerState == 0) {
+        LOG_ERROR(EventSource::AUTOSTEER, "VWAS calib: refused - guidance currently active");
+        return false;
+    }
+    if (vwasCalibrationInProgress()) {
+        LOG_WARNING(EventSource::AUTOSTEER, "VWAS calib: already in progress");
+        return false;
+    }
+    if (kickoutMonitor) kickoutMonitor->clearKickout();
+    vwasCalibLeftAngle = 0.0f;
+    vwasCalibRightAngle = 0.0f;
+    vwasCalibState = VWASCalibState::SWEEP_LEFT;
+    vwasCalibStateStartTime = millis();
+    LOG_INFO(EventSource::AUTOSTEER, "VWAS calib: starting endstop sweep");
+    return true;
+}
+
+void AutosteerProcessor::vwasAbortCalibration() {
+    if (motorPTR) {
+        motorPTR->setPWM(0);
+        motorPTR->enable(false);
+    }
+    motorPWM = 0;
+    vwasCalibState = VWASCalibState::ABORTED;
+    if (kickoutMonitor) kickoutMonitor->clearKickout();
+    LOG_WARNING(EventSource::AUTOSTEER, "VWAS calib: aborted");
+}
+
+const char* AutosteerProcessor::vwasCalibrationStateString() const {
+    switch (vwasCalibState) {
+        case VWASCalibState::IDLE:          return "idle";
+        case VWASCalibState::SWEEP_LEFT:    return "sweeping_left";
+        case VWASCalibState::PAUSE_AT_LEFT: return "pause_left";
+        case VWASCalibState::SWEEP_RIGHT:   return "sweeping_right";
+        case VWASCalibState::PAUSE_AT_RIGHT:return "pause_right";
+        case VWASCalibState::DONE:          return "done";
+        case VWASCalibState::ABORTED:       return "aborted";
+    }
+    return "unknown";
+}
+
+// ============================================================================
+// VWAS config EEPROM persistence
+// ============================================================================
+// Stores the whole WheelAngleFusion::Config struct as one block, guarded by
+// a magic byte so we don't load garbage from a blank/uninitialized EEPROM.
+namespace {
+    constexpr uint8_t VWAS_CONFIG_MAGIC = 0xEE;
+}
+
+void AutosteerProcessor::saveVWASConfig() {
+    if (!wheelAngleFusionPtr) return;
+    uint16_t addr = VWAS_CONFIG_ADDR;
+    EEPROM.put(addr, VWAS_CONFIG_MAGIC);
+    addr += sizeof(VWAS_CONFIG_MAGIC);
+    EEPROM.put(addr, wheelAngleFusionPtr->getConfig());
+    LOG_INFO(EventSource::AUTOSTEER, "VWAS config saved to EEPROM");
+}
+
+void AutosteerProcessor::loadVWASConfig() {
+    if (!wheelAngleFusionPtr) return;
+    uint16_t addr = VWAS_CONFIG_ADDR;
+    uint8_t magic = 0;
+    EEPROM.get(addr, magic);
+    if (magic != VWAS_CONFIG_MAGIC) {
+        // Nothing saved yet - keep the code defaults set just before this
+        // call in initializeFusion().
+        LOG_INFO(EventSource::AUTOSTEER, "VWAS config: no saved config found, using defaults");
+        return;
+    }
+    addr += sizeof(VWAS_CONFIG_MAGIC);
+    WheelAngleFusion::Config cfg;
+    EEPROM.get(addr, cfg);
+    wheelAngleFusionPtr->setConfig(cfg);
+    LOG_INFO(EventSource::AUTOSTEER,
+             "VWAS config loaded from EEPROM: wheelbase=%.2f type=%d cpd=%.1f maxAngle=%.1f dual=%d",
+             cfg.wheelbase, cfg.vehicleType, cfg.countsPerDegree, cfg.maxSteeringAngle,
+             cfg.preferDualHeading ? 1 : 0);
+}
+

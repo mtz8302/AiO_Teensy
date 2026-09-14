@@ -1,0 +1,15 @@
+{
+  "name": "aio_communications",
+  "version": "1.0.0",
+  "description": "AiO v26 Communication Interfaces",
+  "keywords": ["can", "serial", "i2c", "communication"],
+  "authors": {
+    "name": "AiO v26 Team"
+  },
+  "dependencies": [
+    {"name": "aio_system"},
+    {"name": "FlexCAN_T4"}
+  ],
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

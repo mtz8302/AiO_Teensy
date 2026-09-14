@@ -1,0 +1,18 @@
+{
+  "name": "aio_navigation",
+  "version": "1.0.0",
+  "description": "AiO v26 Navigation Components",
+  "keywords": ["gnss", "imu", "navigation"],
+  "authors": {
+    "name": "AiO v26 Team"
+  },
+  "dependencies": [
+    {"name": "aio_system"},
+    {"name": "aio_communications"},
+    {"name": "UBXParser"},
+    {"name": "BNOAiOParser"},
+    {"name": "TM171AiOParser"}
+  ],
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

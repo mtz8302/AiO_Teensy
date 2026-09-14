@@ -1,0 +1,14 @@
+{
+  "name": "aio_config",
+  "version": "1.0.0",
+  "description": "AiO v26 Configuration Management",
+  "keywords": ["config", "eeprom", "hardware"],
+  "authors": {
+    "name": "AiO v26 Team"
+  },
+  "dependencies": [
+    {"name": "aio_system"}
+  ],
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}

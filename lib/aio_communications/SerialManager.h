@@ -1,0 +1,124 @@
+// Firmware_Teensy_AiO-New-Dawn is copyright 2025 by the AOG Group
+// Firmware_Teensy_AiO-New-Dawn is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+// Firmware_Teensy_AiO-New-Dawn is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+// You should have received a copy of the GNU General Public License along with Firmware_Teensy_AiO-New-Dawn. If not, see <https://www.gnu.org/licenses/>.
+// Like most Arduino code, portions of this are based on other open source Arduino code with a compatiable license.
+
+#ifndef SERIALMANAGER_H_
+#define SERIALMANAGER_H_
+
+#include "Arduino.h"
+
+// Serial port definitions
+#define SerialRadio Serial3
+#define SerialIMU Serial4
+#define SerialGPS1 Serial5
+#define SerialRS232 Serial7
+#define SerialGPS2 Serial8
+#define SerialESP32 Serial2
+
+// GPS and IMU type enumerations removed - all detection moved to NAVProcessor
+
+class SerialManager
+{
+private:
+    static SerialManager *instance;
+    bool isInitialized;
+
+    // Private serial buffers (encapsulated, not global)
+    uint8_t gps1RxBuffer[128];
+    uint8_t gps1TxBuffer[256];
+    uint8_t gps2RxBuffer[128];
+    uint8_t gps2TxBuffer[256];
+    uint8_t radioRxBuffer[64];
+    uint8_t rs232TxBuffer[256];
+    uint8_t esp32TxBuffer[256];
+
+    // SerialIMU - owned by SerialManager
+    HardwareSerial *serialIMU;
+
+    // Bridge mode tracking
+    bool prevUSB1DTR;
+    bool prevUSB2DTR;
+
+public:
+    // Buffer sizes
+    static const uint16_t GPS_BUFFER_SIZE = 128;
+    static const uint16_t GPS_TX_BUFFER_SIZE = 256;
+    static const uint16_t RADIO_BUFFER_SIZE = 64;
+    static const uint16_t RS232_BUFFER_SIZE = 256;
+    static const uint16_t ESP32_BUFFER_SIZE = 256;
+
+    // Baud rates
+    static const int32_t BAUD_GPS = 460800;
+    static const int32_t BAUD_RADIO = 115200;
+    static const int32_t BAUD_RS232 = 115200;
+    static const int32_t BAUD_ESP32 = 460800;
+    static const int32_t BAUD_IMU = 115200;
+
+    SerialManager();
+    ~SerialManager();
+
+    static SerialManager *getInstance();
+    static void init();
+
+    // Initialization
+    bool initializeSerial();
+    bool initializeSerialPorts();
+
+    // Device detection handled by NAVProcessor
+
+    // Bridge mode management
+    bool isGPS1Bridged() const;
+    bool isGPS2Bridged() const;
+    void handleGPS1BridgeMode();
+    void handleGPS2BridgeMode();
+
+    // Utility methods
+    void clearSerialBuffers();
+    void sendToRS232(uint8_t *data, uint16_t length);
+    void sendToESP32(uint8_t *data, uint16_t length);
+
+    // Baud rate getters
+    int32_t getGPSBaudRate() const;
+    int32_t getRadioBaudRate() const;
+    int32_t getESP32BaudRate() const;
+    int32_t getRS232BaudRate() const;
+    int32_t getIMUBaudRate() const;
+
+    // Status and debug
+    void printSerialStatus();
+    void printSerialConfiguration();
+    bool getInitializationStatus() const;
+    bool isSerialInitialized() const;
+
+    // Dynamic configuration
+    void updateRadioBaudRate(uint32_t newBaudRate);
+
+    // Buffer usage diagnostics
+    void printBufferUsage();
+    void startBufferMonitoring();
+    void updateBufferStats();
+
+private:
+    // Peak buffer usage tracking
+    struct BufferStats
+    {
+        size_t peakUsage;
+        size_t overflowCount;
+        uint32_t lastCheckTime;
+    };
+
+    BufferStats gps1RxStats = {0, 0, 0};
+    BufferStats gps2RxStats = {0, 0, 0};
+    BufferStats radioRxStats = {0, 0, 0};
+    BufferStats esp32RxStats = {0, 0, 0};
+    BufferStats imuRxStats = {0, 0, 0};
+
+    bool monitoringEnabled = false;
+};
+
+// Global instance (following the same pattern as configManager)
+extern SerialManager serialManager;
+
+#endif // SERIALMANAGER_H_

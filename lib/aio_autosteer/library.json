@@ -1,0 +1,17 @@
+{
+  "name": "aio_autosteer",
+  "version": "1.0.0",
+  "description": "AiO v26 Autosteer Components",
+  "keywords": ["autosteer", "motor", "pid", "control"],
+  "authors": {
+    "name": "AiO v26 Team"
+  },
+  "dependencies": [
+    {"name": "aio_system"},
+    {"name": "aio_config"},
+    {"name": "aio_communications"},
+    {"name": "Encoder"}
+  ],
+  "frameworks": "arduino",
+  "platforms": "teensy"
+}
